@@ -30,6 +30,26 @@ from utils import solve_regularized, learn_multiple_few_shot, eval_multiple
 
 
 # ==============================================================================
+# Seed Setting for Reproducibility
+# ==============================================================================
+
+def set_all_seeds(seed: int):
+    """
+    Set random seeds for all libraries to ensure reproducibility.
+
+    Args:
+        seed: The random seed to use
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+# ==============================================================================
 # Configuration
 # ==============================================================================
 

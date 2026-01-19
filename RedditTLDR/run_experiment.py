@@ -39,7 +39,7 @@ import torch
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.dirname(SCRIPT_DIR))
 
-from experiment_utils import save_results
+from experiment_utils import save_results, set_all_seeds
 
 
 def run_phase1(args):
@@ -197,6 +197,9 @@ Examples:
         args.split_configs = '0.25/0.75,0.5/0.5'
         args.personalize_iterations = 100
         args.verbose = True
+
+    # Set all random seeds for reproducibility
+    set_all_seeds(args.seed)
 
     # Print configuration
     print("\n" + "="*60)
