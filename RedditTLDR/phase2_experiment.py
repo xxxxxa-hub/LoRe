@@ -171,44 +171,33 @@ def method_3_full_pool_baseline(
     learning_rate: float = 0.1,
 ) -> Dict[str, Any]:
     """
-    Method 3: The "Dem+Val" Baseline (Random @ Full)
+    Method 3: The "Dem+Val" Baseline (Full Context)
 
-    Concept: Represents the "Upper Bound" of random sampling if we simply threw
-    all available data (Demo + Val) into the generator pool.
+    Concept: Represents the "Upper Bound" if we use ALL available data
+    (Demo + Val) as the context, without any sampling.
 
     Procedure:
-    1. Randomly sample N_trials different K-shot contexts from full pool (Demo + Val)
-    2. Evaluate all of them on D_test
-    3. Report Mean Accuracy
+    1. Use the entire full pool (Demo + Val) as context
+    2. Learn weights from the full context
+    3. Evaluate on D_test and report accuracy
+
+    Note: k and n_trials parameters are unused since we use the full set.
     """
-    rng = random.Random(seed)
-
-    # Combine Demo and Val into full pool
+    # Combine Demo and Val into full pool - use ALL of it as context
     full_pool = torch.cat([demo_features, val_features], dim=0)
-    n_full = full_pool.shape[0]
 
-    if k > n_full:
-        return {'mean_accuracy': None, 'std_accuracy': None, 'all_accuracies': [], 'skipped': True}
+    # Learn weights from the FULL context (no sampling)
+    w = learn_weights_from_context(full_pool, V, num_iterations, learning_rate)
 
-    accuracies = []
-
-    for trial in range(n_trials):
-        # 1. Sample K from FULL pool (Demo + Val)
-        indices = rng.sample(range(n_full), k)
-        context = full_pool[indices]
-
-        # 2. Learn weights from context
-        w = learn_weights_from_context(context, V, num_iterations, learning_rate)
-
-        # 3. Evaluate on Test (blind)
-        acc = compute_accuracy(test_features, V, w)
-        accuracies.append(acc)
+    # Evaluate on Test
+    acc = compute_accuracy(test_features, V, w)
 
     return {
-        'mean_accuracy': np.mean(accuracies),
-        'std_accuracy': np.std(accuracies),
-        'all_accuracies': accuracies,
+        'mean_accuracy': acc,
+        'std_accuracy': 0.0,  # No variance since we use the full set deterministically
+        'all_accuracies': [acc],
         'skipped': False,
+        'context_size': full_pool.shape[0],
     }
 
 
@@ -313,7 +302,6 @@ def run_experiment_for_user(
 
                 # Unique seed per config
                 method_seed = user_idx * 10000 + seed_idx * 1000 + k
-                breakpoint()
 
                 # ==============================================================
                 # METHOD 1: STRICT BASELINE (Random @ Demo)
