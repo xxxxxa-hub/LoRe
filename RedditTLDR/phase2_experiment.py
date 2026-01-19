@@ -7,7 +7,7 @@
 """
 Phase 2: The Experimental Loop
 
-This script runs the three comparison methods across different configurations
+This script runs the four comparison methods across different configurations
 for EACH UNSEEN USER. Each user has their own:
 - D_pool (train_features_unseen[i]): to split into Demo/Val
 - D_test (test_features_sparse_unseen[i]): held-out test
@@ -18,10 +18,12 @@ Loops:
 - Middle Loop: Bootstrap Seeds (5-fold cross-validation)
 - Inner Loop: Context Size (K = 2, 4, 8 shots)
 
-Three Methods:
+Four Methods:
 1. Strict Baseline (Random @ Demo): Random sampling from demo set only
 2. Optimized Strategy (Your Method): Use validation to select best context
 3. Dem+Val Baseline (Random @ Full): Random sampling from full pool
+4. Hill Climbing with Test: Start from Method 2's best context and iteratively
+   swap in test examples (with pseudo-labels) that better explain validation set
 """
 
 import random
@@ -30,6 +32,7 @@ import sys
 import argparse
 from typing import List, Dict, Any
 from collections import defaultdict
+from tqdm import tqdm
 
 import torch
 import numpy as np
@@ -201,6 +204,152 @@ def method_3_full_pool_baseline(
     }
 
 
+def method_4_hill_climbing_with_test(
+    demo_features: torch.Tensor,
+    val_features: torch.Tensor,
+    test_features: torch.Tensor,
+    V: torch.Tensor,
+    k: int,
+    n_trials: int,
+    seed: int,
+    num_iterations: int = 500,
+    learning_rate: float = 0.1,
+    best_context_indices: List[int] = None,
+) -> Dict[str, Any]:
+    """
+    Method 4: Hill Climbing with Test Hypotheses
+
+    Concept: Start from Method 2's best context and iteratively try to improve
+    by swapping in test examples (with pseudo-labels) that better explain the
+    validation set.
+
+    Key Insight: Features are (winning - losing). So:
+    - y=1 (pseudo-label positive): use feature as-is
+    - y=0 (pseudo-label negative): use -feature (negation)
+
+    This is valid because we NEVER look at test labels for decisions - we only
+    use test inputs + validation labels. If swapping a test example with a
+    guessed label helps explain the validation set better, that label is likely
+    correct.
+
+    Procedure:
+    1. Initialize C_current from Method 2's best context
+    2. Compute baseline S_best = Likelihood(D_val | Learn(C_current))
+    3. For each test example x_i:
+       - For each hypothesis y in {0, 1}:
+         - Create h = (x_i, y) -> feature or -feature
+         - For each position j in C_current:
+           - Trial swap: C' = C_current with position j replaced by h
+           - Evaluate: S' = Likelihood(D_val | Learn(C'))
+           - If S' > S_best: update C_current and S_best
+    4. Final inference using learned weights
+
+    Args:
+        demo_features: Demo set features (K_demo, d)
+        val_features: Validation set features (K_val, d)
+        test_features: Test set features (K_test, d)
+        V: Basis matrix (d, B)
+        k: Context size (number of shots)
+        n_trials: Unused (kept for API consistency)
+        seed: Random seed (unused here, context comes from Method 2)
+        num_iterations: Iterations for weight learning
+        learning_rate: Learning rate for weight learning
+        best_context_indices: Indices from Method 2's best context (into demo_features)
+
+    Returns:
+        Dictionary with test accuracy, improvement stats, etc.
+    """
+    if best_context_indices is None or len(best_context_indices) == 0:
+        return {
+            'test_accuracy': None,
+            'initial_val_score': None,
+            'final_val_score': None,
+            'n_swaps': 0,
+            'skipped': True,
+        }
+
+    # Initialize context from Method 2's best
+    # C_current is a list of (feature_tensor, source_info) tuples
+    # source_info: ('demo', idx) or ('test', idx, label)
+    C_current = []
+    for idx in best_context_indices:
+        C_current.append((demo_features[idx].clone(), ('demo', idx)))
+
+    # Helper function to build context tensor from C_current
+    def get_context_tensor():
+        return torch.stack([item[0] for item in C_current])
+
+    # Compute baseline score
+    context_tensor = get_context_tensor()
+    w = learn_weights_from_context(context_tensor, V, num_iterations, learning_rate)
+    S_best = compute_likelihood_score(val_features, V, w)
+    initial_val_score = S_best
+
+    n_test = test_features.shape[0]
+    n_swaps = 0
+    swap_history = []
+
+    # Iterative refinement: loop through all test examples
+    for test_idx in tqdm(range(n_test)):
+        test_feat = test_features[test_idx]
+
+        # Try both hypotheses: y=1 (use feature) and y=0 (use -feature)
+        for y_label in [1, 0]:
+            # Create hypothesis feature
+            if y_label == 1:
+                h_feat = test_feat.clone()
+            else:
+                h_feat = -test_feat.clone()  # Negation for y=0
+
+            # Try swapping into each position in the context
+            for pos_j in range(len(C_current)):
+                # Save original
+                original_item = C_current[pos_j]
+
+                # Trial swap
+                C_current[pos_j] = (h_feat, ('test', test_idx, y_label))
+
+                # Evaluate
+                context_tensor = get_context_tensor()
+                w_trial = learn_weights_from_context(context_tensor, V, num_iterations, learning_rate)
+                S_trial = compute_likelihood_score(val_features, V, w_trial)
+
+                # Greedy update
+                if S_trial > S_best:
+                    S_best = S_trial
+                    n_swaps += 1
+                    swap_history.append({
+                        'test_idx': test_idx,
+                        'y_label': y_label,
+                        'position': pos_j,
+                        'new_score': S_trial,
+                    })
+                    # Keep the swap (don't restore)
+                else:
+                    # Restore original
+                    C_current[pos_j] = original_item
+
+    # Final inference
+    context_tensor = get_context_tensor()
+    w_final = learn_weights_from_context(context_tensor, V, num_iterations, learning_rate)
+    test_accuracy = compute_accuracy(test_features, V, w_final)
+
+    # Analyze final context composition
+    n_from_demo = sum(1 for _, info in C_current if info[0] == 'demo')
+    n_from_test = sum(1 for _, info in C_current if info[0] == 'test')
+
+    return {
+        'test_accuracy': test_accuracy,
+        'initial_val_score': initial_val_score,
+        'final_val_score': S_best,
+        'n_swaps': n_swaps,
+        'n_from_demo': n_from_demo,
+        'n_from_test': n_from_test,
+        'swap_history': swap_history,
+        'skipped': False,
+    }
+
+
 # ==============================================================================
 # Per-User Experiment Runner
 # ==============================================================================
@@ -353,6 +502,29 @@ def run_experiment_for_user(
                 record['method_3_full_mean_acc'] = m3_results['mean_accuracy']
                 record['method_3_full_std'] = m3_results['std_accuracy']
 
+                # ==============================================================
+                # METHOD 4: HILL CLIMBING WITH TEST HYPOTHESES
+                # ==============================================================
+                breakpoint()
+                m4_results = method_4_hill_climbing_with_test(
+                    demo_features=demo_features,
+                    val_features=val_features,
+                    test_features=test_features,
+                    V=V,
+                    k=k,
+                    n_trials=n_trials,
+                    seed=method_seed,
+                    num_iterations=num_iterations,
+                    learning_rate=learning_rate,
+                    best_context_indices=m2_results['best_context_indices'],
+                )
+                record['method_4_hill_climb_acc'] = m4_results['test_accuracy']
+                record['method_4_initial_val_score'] = m4_results['initial_val_score']
+                record['method_4_final_val_score'] = m4_results['final_val_score']
+                record['method_4_n_swaps'] = m4_results['n_swaps']
+                record['method_4_n_from_demo'] = m4_results.get('n_from_demo', None)
+                record['method_4_n_from_test'] = m4_results.get('n_from_test', None)
+
                 results_log.append(record)
 
     return results_log
@@ -424,6 +596,8 @@ def aggregate_results(results_log: List[Dict]) -> Dict:
         m1_accs = [r['method_1_strict_mean_acc'] for r in records if r['method_1_strict_mean_acc'] is not None]
         m2_accs = [r['method_2_optimized_acc'] for r in records if r['method_2_optimized_acc'] is not None]
         m3_accs = [r['method_3_full_mean_acc'] for r in records if r['method_3_full_mean_acc'] is not None]
+        m4_accs = [r['method_4_hill_climb_acc'] for r in records if r.get('method_4_hill_climb_acc') is not None]
+        m4_swaps = [r['method_4_n_swaps'] for r in records if r.get('method_4_n_swaps') is not None]
 
         summary[f"demo{demo_ratio:.2f}_val{val_ratio:.2f}_k{k}"] = {
             'demo_ratio': demo_ratio,
@@ -442,6 +616,11 @@ def aggregate_results(results_log: List[Dict]) -> Dict:
                 'mean': np.mean(m3_accs) if m3_accs else None,
                 'std': np.std(m3_accs) if m3_accs else None,
             },
+            'method_4': {
+                'mean': np.mean(m4_accs) if m4_accs else None,
+                'std': np.std(m4_accs) if m4_accs else None,
+                'avg_swaps': np.mean(m4_swaps) if m4_swaps else None,
+            },
         }
 
     return summary
@@ -449,9 +628,9 @@ def aggregate_results(results_log: List[Dict]) -> Dict:
 
 def print_summary_table(summary: Dict):
     """Print a formatted summary table."""
-    print("\n" + "="*90)
+    print("\n" + "="*120)
     print("AGGREGATED RESULTS (Averaged across all users and bootstrap seeds)")
-    print("="*90)
+    print("="*120)
 
     # Group by split ratio
     by_split = defaultdict(list)
@@ -461,23 +640,26 @@ def print_summary_table(summary: Dict):
 
     for (demo_ratio, val_ratio), entries in sorted(by_split.items()):
         print(f"\n>>> Split Ratio: Demo={demo_ratio:.0%}, Val={val_ratio:.0%}")
-        print("-"*80)
-        print(f"{'K':>4} | {'Method 1 (Random@Demo)':>25} | {'Method 2 (Optimized)':>22} | {'Method 3 (Full)':>22}")
-        print("-"*80)
+        print("-"*115)
+        print(f"{'K':>4} | {'M1 (Random@Demo)':>20} | {'M2 (Optimized)':>20} | {'M3 (Full)':>20} | {'M4 (HillClimb)':>20} | {'Swaps':>6}")
+        print("-"*115)
 
         for entry in sorted(entries, key=lambda x: x['k']):
             k = entry['k']
             m1 = entry['method_1']
             m2 = entry['method_2']
             m3 = entry['method_3']
+            m4 = entry.get('method_4', {})
 
-            m1_str = f"{m1['mean']*100:.2f}% ± {m1['std']*100:.2f}%" if m1['mean'] else "N/A"
-            m2_str = f"{m2['mean']*100:.2f}% ± {m2['std']*100:.2f}%" if m2['mean'] else "N/A"
-            m3_str = f"{m3['mean']*100:.2f}% ± {m3['std']*100:.2f}%" if m3['mean'] else "N/A"
+            m1_str = f"{m1['mean']*100:.2f}% ± {m1['std']*100:.2f}%" if m1.get('mean') else "N/A"
+            m2_str = f"{m2['mean']*100:.2f}% ± {m2['std']*100:.2f}%" if m2.get('mean') else "N/A"
+            m3_str = f"{m3['mean']*100:.2f}% ± {m3['std']*100:.2f}%" if m3.get('mean') else "N/A"
+            m4_str = f"{m4['mean']*100:.2f}% ± {m4['std']*100:.2f}%" if m4.get('mean') else "N/A"
+            swaps_str = f"{m4['avg_swaps']:.1f}" if m4.get('avg_swaps') is not None else "N/A"
 
-            print(f"{k:>4} | {m1_str:>25} | {m2_str:>22} | {m3_str:>22}")
+            print(f"{k:>4} | {m1_str:>20} | {m2_str:>20} | {m3_str:>20} | {m4_str:>20} | {swaps_str:>6}")
 
-    print("\n" + "="*90)
+    print("\n" + "="*120)
 
 
 def run_phase2(args):
